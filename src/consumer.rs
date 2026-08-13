@@ -32,6 +32,22 @@ use futures::{future::BoxFuture, task::AtomicWaker, Stream};
 
 type FilterPredicate = Option<Arc<dyn Fn(&Message) -> bool + Send + Sync>>;
 
+/// Capacity of the internal delivery channel between the client's message
+/// handler and each `Consumer` / `SuperStreamConsumer` stream. Every buffered
+/// delivery holds a full message body, so the capacity bounds consumer-side
+/// memory when the application drains slower than the broker delivers.
+/// Configured via `RABBITMQ_STREAM_CLIENT_CHANNEL_CAPACITY` (default 10000).
+pub(crate) fn delivery_channel_capacity() -> usize {
+    static CAPACITY: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAPACITY.get_or_init(|| {
+        std::env::var("RABBITMQ_STREAM_CLIENT_CHANNEL_CAPACITY")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|&capacity| capacity > 0)
+            .unwrap_or(10000)
+    })
+}
+
 pub type ConsumerUpdateListener =
     Arc<dyn Fn(u8, MessageContext) -> BoxFuture<'static, OffsetSpecification> + Send + Sync>;
 
@@ -138,7 +154,7 @@ impl ConsumerBuilder {
             .await?;
 
         let subscription_id = 1;
-        let (tx, rx) = channel(10000);
+        let (tx, rx) = channel(delivery_channel_capacity());
         let consumer = Arc::new(ConsumerInternal {
             name: self.consumer_name.clone(),
             subscription_id,

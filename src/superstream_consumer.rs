@@ -1,5 +1,5 @@
 use crate::client::Client;
-use crate::consumer::{ConsumerUpdateListener, Delivery};
+use crate::consumer::{delivery_channel_capacity, ConsumerUpdateListener, Delivery};
 use crate::error::{ConsumerCloseError, ConsumerDeliveryError};
 use crate::superstream::DefaultSuperStreamMetadata;
 use crate::{
@@ -60,7 +60,7 @@ impl SuperStreamConsumerBuilder {
         }
 
         let client = self.environment.create_client().await?;
-        let (tx, rx) = channel(10000);
+        let (tx, rx) = channel(delivery_channel_capacity());
 
         let mut super_stream_metadata = DefaultSuperStreamMetadata {
             super_stream: super_stream.to_string(),
