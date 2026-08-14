@@ -455,9 +455,17 @@ impl Client {
             .collect();
         let len = messages.len();
 
-        // TODO batch publish with max frame size check
-        self.send(PublishCommand::new(publisher_id, messages, version))
-            .await?;
+        // Split the batch so no single frame exceeds the max frame size
+        // negotiated in the tune handshake. An over-sized frame is fatal: the
+        // broker closes the whole connection, killing every in-flight message
+        // on it. Splitting costs one extra frame header per group and nothing
+        // else — the messages travel back-to-back on the same socket either
+        // way, and per-message confirmation semantics are unchanged.
+        let max_frame_size = self.state.read().await.max_frame_size;
+        for group in split_for_frame_size(messages, max_frame_size, version) {
+            self.send(PublishCommand::new(publisher_id, group, version))
+                .await?;
+        }
 
         self.opts.collector.publish(len as u64).await;
 
@@ -821,5 +829,111 @@ impl MessageHandler for Client {
         }
 
         Ok(())
+    }
+}
+
+/// Greedily split `messages` into groups that each fit one wire frame under
+/// `max_frame_size` (the value negotiated in the tune handshake; 0 means the
+/// negotiation ended unlimited).
+///
+/// An over-sized frame is fatal — the broker closes the connection, killing
+/// every in-flight message on it — so the client must never build one out of
+/// an aggregated batch. A message that alone exceeds the budget still gets its
+/// own frame: there is nothing smaller to send and the broker's enforcement is
+/// the final arbiter (unchanged behavior for that message), but it no longer
+/// drags its batch-mates into the same doomed frame.
+fn split_for_frame_size(
+    messages: Vec<PublishedMessage>,
+    max_frame_size: u32,
+    version: u16,
+) -> Vec<Vec<PublishedMessage>> {
+    use rabbitmq_stream_protocol::codec::Encoder as _;
+
+    // Length prefix (4) + command key (2) + command version (2) +
+    // publisher_id (1) + message count (4), rounded up for slack.
+    const PUBLISH_FRAME_OVERHEAD: u32 = 16;
+
+    if max_frame_size == 0 {
+        return vec![messages];
+    }
+    let budget = max_frame_size.saturating_sub(PUBLISH_FRAME_OVERHEAD);
+
+    let mut groups: Vec<Vec<PublishedMessage>> = Vec::new();
+    let mut group: Vec<PublishedMessage> = Vec::new();
+    let mut group_size: u32 = 0;
+    for message in messages {
+        let size = if version == 2 {
+            message.encoded_size_version_2()
+        } else {
+            message.encoded_size()
+        };
+        if !group.is_empty() && group_size.saturating_add(size) > budget {
+            groups.push(std::mem::take(&mut group));
+            group_size = 0;
+        }
+        group_size = group_size.saturating_add(size);
+        group.push(message);
+    }
+    if !group.is_empty() {
+        groups.push(group);
+    }
+    groups
+}
+
+#[cfg(test)]
+mod frame_split_tests {
+    use super::*;
+    use rabbitmq_stream_protocol::codec::Encoder as _;
+    use rabbitmq_stream_protocol::message::Message;
+
+    fn message(id: u64, body_len: usize) -> PublishedMessage {
+        PublishedMessage::new(
+            id,
+            Message::builder().body(vec![b'x'; body_len]).build(),
+            None,
+        )
+    }
+
+    #[test]
+    fn zero_max_frame_size_means_one_group() {
+        let groups = split_for_frame_size(vec![message(1, 500), message(2, 500)], 0, 1);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn small_batch_stays_one_frame() {
+        let groups = split_for_frame_size(vec![message(1, 100), message(2, 100)], 1_048_576, 1);
+        assert_eq!(groups.len(), 1);
+    }
+
+    #[test]
+    fn batch_splits_to_respect_the_frame_budget() {
+        let messages: Vec<_> = (0..10).map(|i| message(i, 400)).collect();
+        let max_frame_size = 1_000u32;
+        let groups = split_for_frame_size(messages, max_frame_size, 1);
+
+        assert!(groups.len() > 1, "10x400B must not fit one 1000B frame");
+        for group in &groups {
+            let size: u32 = group.iter().map(|m| m.encoded_size()).sum();
+            assert!(
+                size + 16 <= max_frame_size,
+                "group of {} bytes exceeds the {}B frame budget",
+                size,
+                max_frame_size
+            );
+        }
+        // Order and identity must be preserved across the split.
+        let ids: Vec<u64> = groups.iter().flatten().map(|m| m.publishing_id()).collect();
+        assert_eq!(ids, (0..10).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn oversized_single_message_gets_its_own_frame() {
+        let messages = vec![message(1, 100), message(2, 5_000), message(3, 100)];
+        let groups = split_for_frame_size(messages, 1_000, 1);
+        assert_eq!(groups.len(), 3, "the whale must not share a frame");
+        assert_eq!(groups[1].len(), 1);
+        assert_eq!(groups[1][0].publishing_id(), 2);
     }
 }

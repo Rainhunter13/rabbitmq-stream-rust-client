@@ -639,8 +639,8 @@ impl MessageHandler for ProducerConfirmHandler {
             }
             Some(Err(error)) => {
                 trace!(?error);
-                // TODO clean all waiting for confirm
                 self.handler_failed.store(true, Ordering::Relaxed);
+                drain_waiting_confirmations(&self.waiting_confirmations).await;
                 return Err(error);
             }
             None => {
@@ -661,9 +661,38 @@ impl MessageHandler for ProducerConfirmHandler {
                 } else {
                     warn!("No on_closed handler set, unconfirmed messages will be lost.");
                 }
+                drain_waiting_confirmations(&self.waiting_confirmations).await;
             }
         }
         Ok(())
+    }
+}
+
+/// Resolve and release every waiter still awaiting a confirmation.
+///
+/// Called when the connection dies (error or close): no confirm frame will
+/// ever arrive for these entries, so leaving them in the map strands their
+/// callbacks AND pins two copies of every in-flight message body for as long
+/// as the map lives. Invoking each callback with `Closed` lets a caller
+/// blocked on a confirmation fail over immediately instead of waiting out its
+/// own timeout blind.
+async fn drain_waiting_confirmations(waiting_confirmations: &WaiterMap) {
+    let mut ids: Vec<u64> = waiting_confirmations
+        .iter()
+        .map(|entry| *entry.key())
+        .collect();
+    ids.sort_unstable();
+    for id in ids {
+        if let Some((_, (_, waiter))) = waiting_confirmations.remove(&id) {
+            match waiter {
+                ProducerMessageWaiter::Once(waiter) => {
+                    (waiter.cb)(Err(ProducerPublishError::Closed)).await;
+                }
+                ProducerMessageWaiter::Shared(waiter) => {
+                    (waiter.cb)(Err(ProducerPublishError::Closed)).await;
+                }
+            }
+        }
     }
 }
 
@@ -746,5 +775,64 @@ impl SharedProducerMessageWaiter {
             cb: confirm_callback,
             msg,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU32};
+
+    /// A dead connection delivers no more confirm frames, so `drain` is the
+    /// only thing standing between an in-flight publish and (a) its caller
+    /// waiting out a blind timeout and (b) two copies of its message body
+    /// pinned in the map for as long as the producer is reachable.
+    #[tokio::test]
+    async fn drain_resolves_and_releases_every_waiter() {
+        let waiting: WaiterMap = Arc::new(DashMap::new());
+        let resolved = Arc::new(AtomicU32::new(0));
+        let saw_closed_error = Arc::new(AtomicBool::new(true));
+
+        for id in 0..3u64 {
+            let resolved = resolved.clone();
+            let saw_closed_error = saw_closed_error.clone();
+            let message = Message::builder().body(vec![b'x'; 64]).build();
+            let waiter = OnceProducerMessageWaiter::waiter_with_cb(
+                move |result: Result<ConfirmationStatus, ProducerPublishError>| {
+                    let resolved = resolved.clone();
+                    let saw_closed_error = saw_closed_error.clone();
+                    async move {
+                        resolved.fetch_add(1, Ordering::SeqCst);
+                        if !matches!(result, Err(ProducerPublishError::Closed)) {
+                            saw_closed_error.store(false, Ordering::SeqCst);
+                        }
+                    }
+                },
+                message.clone(),
+            );
+            waiting.insert(
+                id,
+                (
+                    ClientMessage::new(id, message, None),
+                    ProducerMessageWaiter::Once(waiter),
+                ),
+            );
+        }
+
+        drain_waiting_confirmations(&waiting).await;
+
+        assert_eq!(
+            resolved.load(Ordering::SeqCst),
+            3,
+            "every waiter must be resolved"
+        );
+        assert!(
+            saw_closed_error.load(Ordering::SeqCst),
+            "waiters must resolve with ProducerPublishError::Closed"
+        );
+        assert!(
+            waiting.is_empty(),
+            "the map must hold no message bodies afterwards"
+        );
     }
 }
