@@ -160,7 +160,14 @@ where
 
     pub async fn close(self, error: Option<ClientError>) {
         self.requests.close();
-        if let Some(handler) = self.handler.read().await.as_ref() {
+        // `take()` rather than `read()`: the handler is typically the `Client`
+        // itself (registered in `Client::initialize`), and the `Client` owns
+        // this dispatcher — a reference cycle through `Arc`s. Leaving the
+        // handler in place after close makes every `Client` ever created
+        // unreachable-but-immortal, pinning its codec buffers and state maps
+        // for the life of the process (one leaked generation per reconnect).
+        // Dropping it here breaks the cycle once the connection is done.
+        if let Some(handler) = self.handler.write().await.take() {
             if let Some(err) = error {
                 if let Err(e) = handler.handle_message(Some(Err(err))).await {
                     warn!("Message handler returned error during close: {}", e);
@@ -426,6 +433,36 @@ mod tests {
         assert_eq!(
             count, 2,
             "Handler should be called exactly twice: once from notify, once from close"
+        );
+    }
+
+    struct RetainingHandler {
+        _token: Arc<()>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::client::MessageHandler for RetainingHandler {
+        async fn handle_message(&self, _item: MessageResult) -> crate::RabbitMQStreamResult<()> {
+            Ok(())
+        }
+    }
+
+    /// In production the handler is the `Client` itself, which owns this
+    /// dispatcher — an `Arc` reference cycle. `close` must DROP the handler,
+    /// or every client ever created stays reachable-from-itself forever,
+    /// pinning its codec buffers and state maps (one leaked generation per
+    /// reconnect).
+    #[tokio::test]
+    async fn close_releases_the_handler() {
+        let token = Arc::new(());
+        let weak = Arc::downgrade(&token);
+
+        let dispatcher = Dispatcher::with_handler(RetainingHandler { _token: token });
+        dispatcher.0.clone().close(None).await;
+
+        assert!(
+            weak.upgrade().is_none(),
+            "the handler must be dropped on close, not merely notified"
         );
     }
 
